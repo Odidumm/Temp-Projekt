@@ -1,0 +1,9 @@
+# Laufzeit-Abhängigkeiten.
+# Auf dem Pi das venv mit --system-site-packages anlegen: dann werden gpiozero
+# und lgpio aus den apt-Paketen (python3-gpiozero, python3-lgpio) verwendet.
+flask>=2.3
+requests>=2.28
+python-dotenv>=1.0
+gpiozero>=2.0
+# Pin-Treiber für gpiozero auf dem Raspberry Pi 5 (auf dem Entwicklungs-PC nicht nötig)
+lgpio>=0.2; sys_platform == "linux" and platform_machine == "aarch64"

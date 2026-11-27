@@ -1,0 +1,45 @@
+# Installation:
+#   sudo cp deploy/temp-monitor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now temp-monitor
+# Liegt das Projekt woanders, die drei Pfade unten anpassen.
+
+[Unit]
+Description=Serverraum-Temperaturüberwachung (DS18B20, Push an Server, Alarm-/Warn-LEDs)
+Documentation=file:///home/pi/Desktop/Temp-RestAPI/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+# Zugriff auf /dev/gpiochip*
+SupplementaryGroups=gpio
+WorkingDirectory=/home/pi/Desktop/Temp-RestAPI
+ExecStart=/home/pi/Desktop/Temp-RestAPI/.venv/bin/python -m temp_monitor --env-file /home/pi/Desktop/Temp-RestAPI/.env
+
+# Grenzwerte vom Server überleben Neustarts: /var/lib/temp-monitor/state.json
+# (systemd legt das Verzeichnis an und übergibt es als $STATE_DIRECTORY)
+StateDirectory=temp-monitor
+# lgpio legt seine Hilfsdateien (.lgd-nfy*) hier ab statt im Projektordner
+RuntimeDirectory=temp-monitor
+Environment=LG_WD=/run/temp-monitor
+Environment=PYTHONUNBUFFERED=1
+# Keine Pakete aus ~/.local (pip install --user anderer Projekte) laden,
+# sondern nur venv + apt
+Environment=PYTHONNOUSERSITE=1
+
+Restart=on-failure
+RestartSec=5
+# Exit-Code 2 = Fehler in der .env: nicht endlos neu starten, sondern im Log melden
+RestartPreventExitStatus=2
+
+# Absicherung: nur /var/lib/temp-monitor und /run/temp-monitor sind beschreibbar
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

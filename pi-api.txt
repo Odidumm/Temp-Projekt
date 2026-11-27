@@ -1,0 +1,193 @@
+AUFTRAG UND API-BESCHREIBUNG: MESS-PI -> TEMPERATUR-DASHBOARD
+=============================================================
+
+Du schreibst das Programm für einen Raspberry Pi, der die Temperatur in einem
+Serverraum misst und an ein vorhandenes Dashboard schickt. Es ist ein
+Schulprojekt: einfach und robust ist wichtiger als möglichst viele Funktionen.
+
+Der Server ist fertig und läuft auf einem NAS im selben Netz. Er wird NICHT
+verändert. Die API unten ist ein fester Vertrag. Alle Antworten und
+Fehlermeldungen stammen aus einem Testlauf gegen den echten Server.
+
+
+1. ZUERST MIT DEM NUTZER KLÄREN
+-------------------------------
+- Server-Adresse (BASE_URL), eine von beiden:
+    http://<NAS-IP>:50001      wenn der Pi im selben Netz wie das NAS ist
+    https://api.odidumm.com    von überall, sobald sie im Cloudflare Tunnel eingetragen ist
+- sensor_id und Token (siehe Abschnitt 2)
+- Welcher Temperatursensor? (z. B. DS18B20) An welchem GPIO?
+- An welchem GPIO hängt die LED?
+- Ein Sensor oder mehrere an diesem Pi?
+
+
+2. VORAUSSETZUNG AUF DEM NAS
+----------------------------
+Jeder Sensor muss vorher angelegt werden, im Projektordner auf dem NAS:
+
+  docker compose exec tempmon flask sensor add rack-a --name "Rack A"
+
+Der Befehl zeigt den Token genau einmal an. Die sensor_id besteht aus a-z, 0-9,
+- und _ (höchstens 64 Zeichen). Der Beispiel-curl, den der Befehl ausgibt, nennt
+Port 8081. Verwende stattdessen die Adressen aus Abschnitt 1.
+
+Jeder Sensor hat einen eigenen Token. Hängen zwei Sensoren an einem Pi, braucht
+er zwei sensor_ids und zwei Tokens. Token verloren:
+  docker compose exec tempmon flask sensor rotate-token rack-a
+
+
+3. DIE SCHNITTSTELLE
+--------------------
+POST <BASE_URL>/api/readings
+
+Header:
+  Authorization: Bearer <TOKEN>
+  Content-Type: application/json
+  User-Agent: tempmon-pi/1.0
+
+Der User-Agent ist über https://api.odidumm.com nötig: Cloudflare blockt den
+Standardwert von Python ("Python-urllib/...") mit HTTP 403 "error code: 1010".
+Dort immer https verwenden, sonst geht der Token unverschlüsselt durchs Internet.
+
+Body, alle drei Felder sind Pflicht:
+  {"sensor_id": "rack-a", "temp_c": 23.4, "ts": "2026-11-24T10:30:00Z"}
+
+  sensor_id  Text, muss zum Token gehören
+  temp_c     Zahl (kein Text, nicht null), -40 bis 125
+  ts         Zeitpunkt der Messung, ISO 8601 MIT Zeitzone, am besten UTC mit Z.
+             Höchstens 5 Minuten in der Zukunft.
+
+Antwort bei Erfolg (HTTP 200):
+  {"status": "alarm", "led": "on", "threshold_c": 30.0, "clear_c": 28.0}
+
+  status       "ok", "warn" oder "alarm"
+  led          "on" oder "off". Genau so wird die LED geschaltet.
+  threshold_c  Alarmgrenze: Alarm ab diesem Wert (>=)
+  clear_c      Entwarnung erst UNTER diesem Wert (<)
+
+Beispiel mit Alarmgrenze 30: 30.0 -> on, 28.0 -> bleibt on, 27.9 -> off.
+Die Grenzen werden im Dashboard eingestellt und können sich jederzeit ändern.
+Sie gehören deshalb nicht fest ins Programm.
+
+Fehler, Body immer {"error": "<Text>"}:
+  401  Authorization: Bearer <Token> fehlt
+  401  Ungültiger Token
+  401  Token gehört nicht zu diesem Sensor
+  400  temp_c muss eine Zahl sein
+  400  temp_c außerhalb von -40 bis 125 °C
+  400  ts muss ein ISO-8601-Zeitstempel sein
+  400  ts braucht eine Zeitzone, z. B. 2026-11-20T10:30:00Z
+  400  ts liegt in der Zukunft – Uhrzeit des Pi prüfen (NTP)
+  400  Body muss ein JSON-Objekt sein
+
+Erreichbarkeit prüfen:
+  GET <BASE_URL>/healthz  ->  {"status":"ok","role":"ingest"}
+
+Andere Pfade gibt es dort nicht. Das Dashboard selbst liegt unter
+http://<NAS-IP>:50000 bzw. https://temp.odidumm.com.
+
+
+4. WIE SICH DAS PROGRAMM VERHALTEN SOLL
+---------------------------------------
+Takt
+- Alle 30 Sekunden messen und senden. Nach über 120 Sekunden ohne Meldung zeigt
+  das Dashboard den Sensor als offline.
+
+LED
+- Nach jeder erfolgreichen Antwort auf die aktuelle Messung nach "led" schalten.
+- Ist der Server nicht erreichbar, selbst entscheiden, mit den zuletzt
+  empfangenen Grenzen: an ab threshold_c, aus erst unter clear_c, dazwischen
+  unverändert. Vor der allerersten Antwort bleibt die LED aus.
+
+Uhrzeit (wichtig)
+- Der Server vergleicht ts mit dem letzten Wert dieses Sensors. Ein Wert mit
+  älterem ts wird gespeichert, löst aber KEINEN Alarm aus. Springt die Uhr des
+  Pi zurück, sind neue Werte also so lange wirkungslos, bis ts wieder vorne liegt.
+- Deshalb nach dem Booten erst senden, wenn die Uhr per NTP gestellt ist.
+  Prüfen mit:  timedatectl show -p NTPSynchronized --value   ->  yes
+- ts immer im selben Format senden (siehe Beispielcode).
+
+Messfehler
+- Einen fehlgeschlagenen Messwert nicht senden, nur loggen.
+- Beim DS18B20 den Wert 85.0 verwerfen: Das ist sein Startwert nach dem
+  Einschalten. Der Server würde ihn annehmen und Alarm auslösen.
+
+Fehler beim Senden
+- Timeout 5 Sekunden. Das Programm darf nie abstürzen, beim nächsten Takt geht
+  es weiter.
+- Nicht erreichbar, Timeout oder HTTP 5xx (kommt auch von Cloudflare, wenn das NAS
+  aus ist): Messwert puffern.
+- 403: kommt von Cloudflare, nicht vom Server. Loggen, User-Agent prüfen, puffern.
+- 400: Messwert verwerfen und loggen. Ein neuer Versuch hilft nicht.
+- 401: deutlich loggen (Token oder sensor_id falsch), nicht puffern.
+
+Puffer
+- Im Arbeitsspeicher reicht, begrenzt (z. B. 2000 Werte, die ältesten fallen raus).
+- Nach einem Ausfall ZUERST den aktuellen Wert senden, danach die gepufferten mit
+  ihrem ursprünglichen ts. So reagiert der Alarm sofort, und die alten Werte
+  füllen nur das Diagramm auf.
+- Die Antworten auf gepufferte Werte nicht für die LED verwenden.
+- Der Server erkennt keine doppelten Werte.
+
+Betrieb
+- BASE_URL, sensor_id, Token und GPIOs in eine Konfigurationsdatei, nicht in den Code.
+- Als systemd-Dienst, der beim Booten startet und nach Fehlern neu startet.
+
+
+5. BEISPIELCODE (Python, nur Standardbibliothek, getestet)
+----------------------------------------------------------
+--- BEGIN CODE ---
+import json
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def send(base_url, token, sensor_id, temp_c, ts):
+    """Liefert (HTTP-Status, Antwort). Status None = Server nicht erreichbar."""
+    body = json.dumps({"sensor_id": sensor_id, "temp_c": temp_c, "ts": ts}).encode()
+    req = urllib.request.Request(
+        base_url + "/api/readings", data=body, method="POST",
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+            "User-Agent": "tempmon-pi/1.0",  # Cloudflare blockt den Standardwert von Python
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.load(resp)
+    except urllib.error.HTTPError as err:
+        try:
+            return err.code, json.load(err)
+        except ValueError:
+            return err.code, {"error": str(err)}
+    except (OSError, ValueError) as err:
+        return None, {"error": str(err)}
+--- END CODE ---
+
+Aufruf:
+  send(BASE_URL, TOKEN, "rack-a", 23.4, utc_now())
+
+
+6. TEST OHNE SENSOR (im Terminal des Pi)
+----------------------------------------
+curl -sS <BASE_URL>/api/readings \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"sensor_id": "rack-a", "temp_c": 23.4, "ts": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}'
+
+Erwartet:  {"status":"ok","led":"off","threshold_c":30.0,"clear_c":28.0}
+(Die Grenzen können abweichen, je nach Einstellung im Dashboard.)
+
+
+7. FERTIG, WENN
+---------------
+- der Sensor im Dashboard (http://<NAS-IP>:50000) online ist
+- die LED bei Werten ab der Alarmgrenze angeht und erst unter clear_c ausgeht
+- das Programm einen Ausfall des NAS übersteht und die Werte danach nachliefert
+- es nach einem Neustart des Pi von selbst wieder läuft
